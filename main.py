@@ -1,4 +1,3 @@
-# main.py
 import cv2
 import pandas as pd
 import collections
@@ -10,7 +9,9 @@ from config import (
     MORNING_EARLY_START, MORNING_PERMISSION_END,
     AFTERNOON_NORMAL_START, AFTERNOON_PERMISSION_END,
     AFTERNOON_PERMISSION_START, MORNING_PERMISSION_START,
-    QUIT_TIME_START, QUIT_TIME_END
+    QUIT_TIME_START, QUIT_TIME_END,
+    LIVENESS_ENABLED, EAR_THRESHOLD, BLINK_CONSECUTIVE_FRAMES,
+    REQUIRED_BLINKS, LIVENESS_DETECTION_WINDOW
 )
 from recognition import build_embedding_db, recognize_face
 from attendance import (
@@ -19,10 +20,10 @@ from attendance import (
 )
 from email_service import notify_all
 from utils import draw_label, safe_to_csv, FaceStabilizer
+from liveness import BlinkDetector
 
 # Cooldown constant
 ATTENDANCE_COOLDOWN_SECONDS = 10
-
 
 def try_open_webcam():
     for idx in range(3):
@@ -34,24 +35,29 @@ def try_open_webcam():
     print("❌ Webcam not accessible.")
     return None
 
-
 def init_attendance(people):
     return {
         name: {
-            "time_spans": [], "total_seconds": 0, "detections": [],
-            "morning_first_seen": None, "afternoon_first_seen": None,
-            "quit_time_seen": None, "morning": {}, "afternoon": {},
-            "quit_time": {}, "final_status": "Absent",
-            "permitted_morning": False, "permitted_afternoon": False,
-            "detected_frames": 0, "session_start_time": None,
+            "time_spans": [],
+            "total_seconds": 0,
+            "detections": [],
+            "morning_first_seen": None,
+            "afternoon_first_seen": None,
+            "quit_time_seen": None,
+            "morning": {},
+            "afternoon": {},
+            "quit_time": {},
+            "final_status": "Absent",
+            "permitted_morning": False,
+            "permitted_afternoon": False,
+            "detected_frames": 0,
+            "session_start_time": None,
             "current_session_duration": 0.0
         }
         for name in people
     }
 
-
 def draw_telemetry(frame, fps, total_faces, recognized, unregistered):
-    """Draws a lightweight telemetry HUD in the top-left corner."""
     lines = [
         f"FPS: {fps:.1f}",
         f"Faces: {total_faces}",
@@ -71,9 +77,7 @@ def draw_telemetry(frame, fps, total_faces, recognized, unregistered):
         y = y_start + i * line_height
         cv2.putText(frame, line, (x, y), font, scale, (0, 255, 180), thickness, cv2.LINE_AA)
 
-
 def draw_activity_panel(frame, activity_log):
-    """Renders recent detection history on the right side of the frame."""
     if not activity_log:
         return
 
@@ -85,7 +89,6 @@ def draw_activity_panel(frame, activity_log):
     x_start = frame_w - panel_w - 10
     y_start = 10
 
-    # Semi-transparent background
     overlay = frame.copy()
     cv2.rectangle(overlay,
                   (x_start - 5, y_start),
@@ -102,37 +105,27 @@ def draw_activity_panel(frame, activity_log):
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.52, color, 1, cv2.LINE_AA)
 
-
 # ── Quality Validation ─────────────────────────────────────────────────────
-QUALITY_MIN_FACE_SIZE = 70       # px — below this = too far (laptop-friendly)
-QUALITY_EDGE_MARGIN   = 10       # px — face touching frame border
-QUALITY_MIN_ASPECT    = 0.6      # w/h ratio — too narrow = turned/occluded
-QUALITY_MAX_ASPECT    = 1.6      # w/h ratio — too wide = unusual angle
+QUALITY_MIN_FACE_SIZE = 70
+QUALITY_EDGE_MARGIN   = 10
+QUALITY_MIN_ASPECT    = 0.6
+QUALITY_MAX_ASPECT    = 1.6
 
 def check_face_quality(x, y, w, h, frame_w, frame_h):
-    """
-    Returns (passed: bool, reason: str | None).
-    Geometry-only — no ML cost.
-    """
-    # Too small / too far from camera
     if w < QUALITY_MIN_FACE_SIZE or h < QUALITY_MIN_FACE_SIZE:
         return False, "Face Too Far"
 
-    # Partially outside frame (clipped by edge)
     if (x <= QUALITY_EDGE_MARGIN or
         y <= QUALITY_EDGE_MARGIN or
         x + w >= frame_w - QUALITY_EDGE_MARGIN or
         y + h >= frame_h - QUALITY_EDGE_MARGIN):
         return False, "Adjust Position"
 
-    # Skewed aspect ratio — turned head / partial occlusion
     aspect = w / h
     if not (QUALITY_MIN_ASPECT <= aspect <= QUALITY_MAX_ASPECT):
         return False, "Face Not Properly Visible"
 
     return True, None
-# ───────────────────────────────────────────────────────────────────────────
-
 
 def run_attendance():
     print("📷 Opening webcam...")
@@ -140,7 +133,6 @@ def run_attendance():
     if cap is None:
         return
 
-    # Get frame dimensions for quality validation
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"📐 Frame dimensions: {frame_w}x{frame_h}")
@@ -164,21 +156,37 @@ def run_attendance():
     interval_open = {name: None for name in people}
     consecutive_detects = {name: 0 for name in people}
     cooldown_until = {name: None for name in people}
-    
-    # Activity panel initialization
+
+    # ── Liveness Detection Initialization ──────────────────────────────────
+    if LIVENESS_ENABLED:
+        blink_detector = BlinkDetector(
+            ear_threshold=EAR_THRESHOLD,
+            consecutive_frames=BLINK_CONSECUTIVE_FRAMES,
+            required_blinks=REQUIRED_BLINKS,
+            detection_window=LIVENESS_DETECTION_WINDOW
+        )
+        liveness_verified = {name: False for name in people}
+        liveness_last_verified_time = {name: None for name in people}
+        print("✅ Liveness detection enabled - blink to verify")
+    else:
+        blink_detector = None
+        liveness_verified = {name: True for name in people}
+        liveness_last_verified_time = {name: datetime.now() for name in people}
+        print("⚠️  Liveness detection disabled")
+    # ───────────────────────────────────────────────────────────────────────
+
     activity_log = collections.deque(maxlen=5)
     last_activity_time = {}
     ACTIVITY_COOLDOWN = 3
-    
+
     stabilizers = {}
-    
-    # Telemetry initialization
+
     frame_times = collections.deque(maxlen=30)
     fps = 0.0
     frame_total_faces = 0
     frame_recognized = 0
     frame_unregistered = 0
-    
+
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
@@ -186,7 +194,6 @@ def run_attendance():
     frame_count = 0
 
     while True:
-        # FPS Tracking
         frame_times.append(datetime.now().timestamp())
         if len(frame_times) >= 2:
             fps = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
@@ -200,12 +207,25 @@ def run_attendance():
         now = datetime.now()
         now_t = now.time()
 
+        # ── Liveness detection on full frame ──────────────────────────────
+        if LIVENESS_ENABLED and blink_detector:
+            live_status, display = blink_detector.process_frame(frame)
+            
+            if live_status:
+                for name in people:
+                    if name in last_seen and last_seen[name] is not None:
+                        if (now - last_seen[name]).total_seconds() < 5:
+                            if not liveness_verified[name]:
+                                liveness_verified[name] = True
+                                liveness_last_verified_time[name] = now
+                                activity_log.append((now, f"👁 Liveness OK - {name}", (0, 255, 0)))
+        # ───────────────────────────────────────────────────────────────────
+
         if frame_count % FRAME_SKIP == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)[:MAX_PEOPLE_PER_FRAME]
             names_already_assigned = set()
             
-            # Reset per-frame counters
             frame_total_faces = 0
             frame_recognized = 0
             frame_unregistered = 0
@@ -216,7 +236,6 @@ def run_attendance():
                 
                 frame_total_faces += 1
                 
-                # ── Quality Validation ─────────────────────────────────────
                 quality_ok, quality_reason = check_face_quality(x, y, w, h, frame_w, frame_h)
                 
                 if not quality_ok:
@@ -224,7 +243,6 @@ def run_attendance():
                     draw_label(display, quality_reason, x, y, (0, 165, 255))
                     frame_unregistered += 1
                     continue
-                # ───────────────────────────────────────────────────────────
                 
                 face_img = frame[y:y+h, x:x+w]
                 try:
@@ -234,19 +252,16 @@ def run_attendance():
 
                 raw_name, score = recognize_face(face_img_resized, db)
                 
-                # Counters
                 if raw_name is not None and raw_name not in ("Unknown", "Unregistered Face"):
                     frame_recognized += 1
                 else:
                     frame_unregistered += 1
                     
-                    # Activity log for unregistered faces (with spam prevention)
                     if "__unknown__" not in last_activity_time or \
                        (now - last_activity_time["__unknown__"]).total_seconds() > ACTIVITY_COOLDOWN:
                         activity_log.append((now, "⚠ Unregistered", (0, 165, 255)))
                         last_activity_time["__unknown__"] = now
 
-                # Position-based stabilizer
                 slot_key = f"face_{idx}"
                 
                 if slot_key not in stabilizers:
@@ -258,11 +273,14 @@ def run_attendance():
                     name = stable_label
                     color = (0, 255, 0)
                     duration = attendance[name]["current_session_duration"]
-                    label_text = f"{name} ({score:.2f}) {duration:.1f}s"
+                    
+                    is_live = liveness_verified.get(name, False)
+                    liveness_status = "✓" if is_live else "⏳"
+                    
+                    label_text = f"{name} ({score:.2f}) {duration:.1f}s {liveness_status}"
                     cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
                     draw_label(display, label_text, x, y, color)
 
-                    # ── Cooldown overlay (UI-only) ─────────────────────────
                     if cooldown_until[name] and now < cooldown_until[name]:
                         remaining = int((cooldown_until[name] - now).total_seconds()) + 1
                         draw_label(
@@ -272,27 +290,25 @@ def run_attendance():
                             y + h + 20,
                             (0, 220, 120)
                         )
-                    # ───────────────────────────────────────────────────────
                     
-                    # Activity log for recognized faces (with spam prevention)
                     if cooldown_until.get(name) and now < cooldown_until.get(name):
                         if name not in last_activity_time or \
                            (now - last_activity_time[name]).total_seconds() > ACTIVITY_COOLDOWN:
-                            activity_log.append((now, f"✓ {name}", (0, 255, 180)))
+                            activity_log.append((now, f"✓ {name} {liveness_status}", (0, 255, 180)))
                             last_activity_time[name] = now
 
                     if name not in names_already_assigned:
                         names_already_assigned.add(name)
                         consecutive_detects[name] += 1
 
-                        if consecutive_detects[name] >= CONSEC_DETECTS_REQUIRED:
+                        if (consecutive_detects[name] >= CONSEC_DETECTS_REQUIRED and is_live):
+                            
                             record = attendance[name]
                             if not in_session[name]:
                                 interval_open[name] = now
                                 in_session[name] = True
                                 record["session_start_time"] = now
                                 
-                                # Cooldown trigger (UI-only)
                                 if cooldown_until[name] is None or now >= cooldown_until[name]:
                                     cooldown_until[name] = now + timedelta(seconds=ATTENDANCE_COOLDOWN_SECONDS)
                                 
@@ -300,7 +316,6 @@ def run_attendance():
                             attendance[name]["detected_frames"] += 1
                             record["detections"].append(now)
 
-                            # Time-window bucketing
                             if MORNING_EARLY_START <= now_t < MORNING_PERMISSION_END:
                                 if record["morning_first_seen"] is None:
                                     record["morning_first_seen"] = now
@@ -329,12 +344,16 @@ def run_attendance():
                         cv2.rectangle(display, (x, y), (x+w, y+h), (0, 0, 255), 2)
                         draw_label(display, stable_label, x, y, (0, 0, 255))
 
-            # Reset non-detected counters
             for name in people:
                 if name not in names_already_assigned:
                     consecutive_detects[name] = 0
+                    
+                    if LIVENESS_ENABLED and last_seen[name]:
+                        if (now - last_seen[name]).total_seconds() > 5:
+                            if liveness_verified[name] and liveness_last_verified_time[name]:
+                                if (now - liveness_last_verified_time[name]).total_seconds() > 10:
+                                    liveness_verified[name] = False
 
-            # Session timeout
             for name in people:
                 if in_session[name] and last_seen[name]:
                     if (now - last_seen[name]).total_seconds() > ABSENT_TIMEOUT:
@@ -350,7 +369,6 @@ def run_attendance():
 
         frame_count += 1
         
-        # Draw overlays
         draw_telemetry(display, fps, frame_total_faces, frame_recognized, frame_unregistered)
         draw_activity_panel(display, activity_log)
         
@@ -363,7 +381,6 @@ def run_attendance():
     cap.release()
     cv2.destroyAllWindows()
 
-    # Finalize sessions
     now = datetime.now()
     for name in people:
         if in_session[name] and interval_open[name]:
@@ -378,7 +395,6 @@ def run_attendance():
         rec["quit_time"] = bucket_quit_time(rec["quit_time_seen"])
         rec["final_status"] = overall_status(rec) if rec["detected_frames"] > 0 else "Absent"
 
-    # Save intermediate log
     rows = [{
         "Name": name,
         "Total Seconds": round(attendance[name]["total_seconds"], 2),
@@ -397,7 +413,6 @@ def run_attendance():
 
     print(f"\n⏱️  Start: {webcam_start}  |  End: {webcam_end}")
 
-    # Manual override
     print("\n🛠️  Manually grant Full Attendance? (y/n)")
     if input().strip().lower() == 'y':
         names_input = input("Names (comma-separated): ").strip()
@@ -409,7 +424,6 @@ def run_attendance():
             else:
                 print(f"❌ Not found: {name}")
 
-    # Save final log with First/Last Seen
     final_rows = []
     for name in people:
         rec = attendance[name]
@@ -419,10 +433,7 @@ def run_attendance():
         final_rows.append({**rows[people.index(name)], "First Seen": first, "Last Seen": last})
 
     safe_to_csv(pd.DataFrame(final_rows), "final_attendance_log.csv")
-
-    # Send email notifications
     notify_all(people, attendance)
-
 
 if __name__ == "__main__":
     run_attendance()
