@@ -52,3 +52,10 @@ LIVENESS_DETECTION_WINDOW = 10
 # ── MediaPipe Settings ─────────────────────────────────────────────────────
 MEDIAPIPE_MIN_DETECTION_CONFIDENCE = 0.5
 MEDIAPIPE_MIN_TRACKING_CONFIDENCE = 0.5
+
+# ── Anti-Spoofing Challenge Settings ──────────────────────────────────────
+ENABLE_CHALLENGES = True
+HEAD_MOVEMENT_THRESHOLD = 0.03
+CHALLENGE_TIMEOUT = 5
+CHALLENGES_REQUIRED = 2
+MAX_CHALLENGE_ATTEMPTS = 3
