@@ -8,8 +8,9 @@ import os
 import pandas as pd
 import base64
 import cv2
+import numpy as np  # Add this import
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any, Union  # Add Any, Union
 from contextlib import contextmanager
 
 
@@ -142,6 +143,43 @@ class DatabaseManager:
                 )
             ''')
             
+            # ── Analytics Tables ──────────────────────────────────────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analytics_summary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date DATE NOT NULL,
+                    total_detections INTEGER DEFAULT 0,
+                    successful_recognitions INTEGER DEFAULT 0,
+                    failed_recognitions INTEGER DEFAULT 0,
+                    unknown_faces INTEGER DEFAULT 0,
+                    review_queue_entries INTEGER DEFAULT 0,
+                    avg_confidence REAL DEFAULT 0,
+                    min_confidence REAL DEFAULT 0,
+                    max_confidence REAL DEFAULT 0,
+                    total_attendance INTEGER DEFAULT 0,
+                    half_attendance INTEGER DEFAULT 0,
+                    absent INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    detections INTEGER DEFAULT 0,
+                    avg_confidence REAL DEFAULT 0,
+                    first_seen DATETIME,
+                    last_seen DATETIME,
+                    total_time_seconds REAL DEFAULT 0,
+                    status TEXT DEFAULT 'Absent',
+                    FOREIGN KEY (person_id) REFERENCES people(id),
+                    UNIQUE(person_id, date)
+                )
+            ''')
+            
             # Create indexes for performance
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_person ON attendance(person_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(session_date)')
@@ -156,8 +194,11 @@ class DatabaseManager:
     
     # ── People Operations ──────────────────────────────────────────────────
     
-    def add_person(self, name: str) -> int:
+    def add_person(self, name: str) -> Optional[int]:
         """Add a new person to the database"""
+        if not name or not name.strip():
+            return None
+            
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -172,6 +213,9 @@ class DatabaseManager:
     
     def get_person_id(self, name: str) -> Optional[int]:
         """Get person ID by name"""
+        if not name or not name.strip():
+            return None
+            
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT id FROM people WHERE name = ?', (name.strip(),))
@@ -201,7 +245,7 @@ class DatabaseManager:
     
     # ── Attendance Operations ──────────────────────────────────────────────
     
-    def save_attendance(self, name: str, data: Dict) -> bool:
+    def save_attendance(self, name: str, data: Dict[str, Any]) -> bool:
         """
         Save or update attendance record for a person
         
@@ -209,9 +253,15 @@ class DatabaseManager:
             name: Person's name
             data: Dictionary containing attendance data
         """
+        if not name or not name.strip():
+            return False
+            
         person_id = self.get_person_id(name)
         if person_id is None:
             person_id = self.add_person(name)
+        
+        if person_id is None:
+            return False
         
         session_date = datetime.now().strftime("%Y-%m-%d")
         
@@ -242,7 +292,7 @@ class DatabaseManager:
                         permission_afternoon_used = ?
                     WHERE id = ?
                 ''', (
-                    data.get('morning_first_seen'),
+                    data.get('first_seen'),
                     data.get('last_seen'),
                     data.get('total_seconds', 0),
                     data.get('morning_status'),
@@ -345,6 +395,9 @@ class DatabaseManager:
         if person_id is None:
             person_id = self.add_person(name)
         
+        if person_id is None:
+            return
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -376,6 +429,9 @@ class DatabaseManager:
         if person_id is None:
             person_id = self.add_person(name)
         
+        if person_id is None:
+            return
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -393,7 +449,7 @@ class DatabaseManager:
             
             conn.commit()
     
-    def get_all_permissions(self) -> Dict:
+    def get_all_permissions(self) -> Dict[Tuple[str, str], int]:
         """Get all permissions as dictionary"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -417,6 +473,9 @@ class DatabaseManager:
         person_id = self.get_person_id(name)
         if person_id is None:
             person_id = self.add_person(name)
+        
+        if person_id is None:
+            return False
         
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -450,6 +509,9 @@ class DatabaseManager:
         if person_id is None:
             person_id = self.add_person(name)
         
+        if person_id is None:
+            return
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -476,6 +538,8 @@ class DatabaseManager:
             review_id: ID of the created review record
         """
         person_id = self.get_person_id(name) if name else None
+        if not person_id and name:
+            person_id = self.add_person(name)
         
         # Convert image to base64 if provided
         image_base64 = None
@@ -498,7 +562,7 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
     
-    def get_pending_reviews(self, limit: int = 50) -> List[Dict]:
+    def get_pending_reviews(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Get all pending review items"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -521,7 +585,7 @@ class DatabaseManager:
             results = cursor.fetchall()
             return [dict(row) for row in results]
     
-    def get_all_reviews(self, status: Optional[str] = None) -> List[Dict]:
+    def get_all_reviews(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all review items, optionally filtered by status"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -579,6 +643,9 @@ class DatabaseManager:
         if person_id is None:
             person_id = self.add_person(actual_name)
         
+        if person_id is None:
+            return False
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -632,7 +699,7 @@ class DatabaseManager:
             conn.commit()
             return True
     
-    def get_review_statistics(self) -> Dict:
+    def get_review_statistics(self) -> Dict[str, Any]:
         """Get statistics about the review queue"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -648,9 +715,70 @@ class DatabaseManager:
             ''')
             
             stats = cursor.fetchone()
-            return dict(stats) if stats else {
-                'total': 0, 'pending': 0, 'approved': 0, 'rejected': 0, 'avg_confidence': 0
+            if stats:
+                return dict(stats)
+            return {
+                'total': 0, 'pending': 0, 'approved': 0, 'rejected': 0, 'avg_confidence': 0.0
             }
+    
+    # ── Analytics Operations ──────────────────────────────────────────────
+    
+    def update_analytics_summary(self, date: str, data: Dict[str, Any]):
+        """Update daily analytics summary"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO analytics_summary (
+                    date, total_detections, successful_recognitions,
+                    failed_recognitions, unknown_faces, review_queue_entries,
+                    avg_confidence, min_confidence, max_confidence,
+                    total_attendance, half_attendance, absent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                date,
+                data.get('total_detections', 0),
+                data.get('successful_recognitions', 0),
+                data.get('failed_recognitions', 0),
+                data.get('unknown_faces', 0),
+                data.get('review_queue_entries', 0),
+                data.get('avg_confidence', 0.0),
+                data.get('min_confidence', 0.0),
+                data.get('max_confidence', 0.0),
+                data.get('total_attendance', 0),
+                data.get('half_attendance', 0),
+                data.get('absent', 0)
+            ))
+            conn.commit()
+    
+    def update_daily_stats(self, name: str, date: str, data: Dict[str, Any]):
+        """Update daily stats for a person"""
+        person_id = self.get_person_id(name)
+        if person_id is None:
+            person_id = self.add_person(name)
+        
+        if person_id is None:
+            return
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_stats (
+                    person_id, date, detections, avg_confidence,
+                    first_seen, last_seen, total_time_seconds, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                person_id,
+                date,
+                data.get('detections', 0),
+                data.get('avg_confidence', 0.0),
+                data.get('first_seen'),
+                data.get('last_seen'),
+                data.get('total_time_seconds', 0.0),
+                data.get('status', 'Absent')
+            ))
+            conn.commit()
     
     # ── Export Operations (Backward Compatibility) ──────────────────────
     
@@ -730,7 +858,7 @@ class DatabaseManager:
 # ── Singleton instance ──────────────────────────────────────────────────
 _db_instance = None
 
-def get_db():
+def get_db() -> DatabaseManager:
     """Get singleton database instance"""
     global _db_instance
     if _db_instance is None:
