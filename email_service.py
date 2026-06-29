@@ -1,18 +1,38 @@
-# email_service.py
 import os
 import smtplib
 import pandas as pd
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from config import SENDER_EMAIL, SENDER_PASSWORD, CONTACTS_CSV
+from config import SENDER_EMAIL, SENDER_PASSWORD, CONTACTS_CSV, USE_DATABASE
+
+# Try to import database module
+if USE_DATABASE:
+    try:
+        from database import get_db
+        db = get_db()
+    except ImportError:
+        USE_DATABASE = False
 
 
 def load_contacts() -> dict:
-    """Load name->email map from contacts.csv, fallback to hardcoded."""
+    """Load name->email map from database or CSV"""
+    if USE_DATABASE:
+        try:
+            db = get_db()
+            return db.get_all_contacts()
+        except Exception:
+            # Fallback to CSV
+            return load_contacts_from_csv()
+    else:
+        return load_contacts_from_csv()
+
+
+def load_contacts_from_csv() -> dict:
+    """Load contacts from CSV (backward compatibility)"""
     if os.path.exists(CONTACTS_CSV):
         df = pd.read_csv(CONTACTS_CSV)
         return dict(zip(df['Name'].str.lower(), df['Email']))
-    return {}  # Empty fallback; add entries to contacts.csv
+    return {}
 
 
 def send_email(to_email: str, subject: str, body: str):
