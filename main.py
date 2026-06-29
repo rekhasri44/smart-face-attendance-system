@@ -24,6 +24,14 @@ from email_service import notify_all
 from utils import draw_label, safe_to_csv, FaceStabilizer
 from liveness import BlinkDetector
 
+# Try to import database module - handle gracefully if not available
+try:
+    from database import get_db
+    DATABASE_AVAILABLE = True
+except ImportError:
+    DATABASE_AVAILABLE = False
+    print("⚠️  Database module not found - review queue disabled")
+
 # Cooldown constant
 ATTENDANCE_COOLDOWN_SECONDS = 10
 
@@ -59,12 +67,13 @@ def init_attendance(people):
         for name in people
     }
 
-def draw_telemetry(frame, fps, total_faces, recognized, unregistered):
+def draw_telemetry(frame, fps, total_faces, recognized, unregistered, review_count=0):
     lines = [
         f"FPS: {fps:.1f}",
         f"Faces: {total_faces}",
         f"Recognized: {recognized}",
         f"Unregistered: {unregistered}",
+        f"Review Queue: {review_count}"
     ]
     x, y_start, line_height = 10, 20, 22
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -142,12 +151,12 @@ def run_attendance():
     webcam_start = datetime.now().strftime("%H:%M:%S")
 
     try:
-        db, people = build_embedding_db()
+        embedding_db, people = build_embedding_db()  # Renamed to embedding_db
     except Exception as e:
         print(f"❌ Dataset error: {e}")
         return
 
-    if not db or not people:
+    if not embedding_db or not people:
         print("❌ No embeddings loaded.")
         return
 
@@ -182,6 +191,17 @@ def run_attendance():
         print("⚠️  Liveness detection disabled")
     # ───────────────────────────────────────────────────────────────────────
 
+    # ── Database and Review Queue ──────────────────────────────────────────
+    db_handler = None
+    if DATABASE_AVAILABLE:
+        try:
+            db_handler = get_db()
+            print("✅ Database connection established")
+        except Exception as e:
+            print(f"⚠️  Database connection failed: {e}")
+            db_handler = None
+    # ───────────────────────────────────────────────────────────────────────
+
     activity_log = collections.deque(maxlen=5)
     last_activity_time = {}
     ACTIVITY_COOLDOWN = 3
@@ -193,6 +213,7 @@ def run_attendance():
     frame_total_faces = 0
     frame_recognized = 0
     frame_unregistered = 0
+    total_review_count = 0  # Track total reviews across all frames
 
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -258,6 +279,7 @@ def run_attendance():
             frame_total_faces = 0
             frame_recognized = 0
             frame_unregistered = 0
+            frame_review_count = 0  # Reset per frame
 
             for idx, (x, y, w, h) in enumerate(faces):
                 if w < MIN_FACE_SIZE or h < MIN_FACE_SIZE:
@@ -279,7 +301,45 @@ def run_attendance():
                 except Exception:
                     continue
 
-                raw_name, score = recognize_face(face_img_resized, db)
+                # ── Recognition with Review Queue ──────────────────────────────
+                # Check if recognize_face returns 2 or 3 values
+                result = recognize_face(face_img_resized, embedding_db)
+                if len(result) == 3:
+                    raw_name, score, review_needed = result
+                else:
+                    raw_name, score = result
+                    review_needed = False
+
+                # ── Review Queue Logic ──────────────────────────────────────────
+                if review_needed and db_handler is not None:
+                    try:
+                        # Store the face image for review
+                        review_id = db_handler.add_to_review_queue(
+                            name=raw_name if raw_name and raw_name not in ("Unknown", "Unregistered Face") else "Unknown",
+                            confidence=score,
+                            face_image=face_img,
+                            notes=f"Borderline match - score: {score:.3f}"
+                        )
+                        
+                        frame_review_count += 1
+                        total_review_count += 1
+                        
+                        # Show on screen that review is needed
+                        cv2.rectangle(display, (x, y), (x+w, y+h), (255, 200, 0), 2)
+                        draw_label(display, f"Review Needed: {score:.3f}", x, y, (255, 200, 0))
+                        
+                        # Log activity
+                        if "review_needed" not in last_activity_time or \
+                           (now - last_activity_time["review_needed"]).total_seconds() > ACTIVITY_COOLDOWN:
+                            activity_log.append((now, f"📋 Review Needed - {raw_name or 'Unknown'}", (255, 200, 0)))
+                            last_activity_time["review_needed"] = now
+                        
+                        # Don't mark attendance, skip to next face
+                        continue
+                    except Exception as e:
+                        print(f"⚠️  Failed to add to review queue: {e}")
+                        # Fall through to normal recognition
+                # ──────────────────────────────────────────────────────────────────
                 
                 if raw_name is not None and raw_name not in ("Unknown", "Unregistered Face"):
                     frame_recognized += 1
@@ -409,7 +469,8 @@ def run_attendance():
 
         frame_count += 1
         
-        draw_telemetry(display, fps, frame_total_faces, frame_recognized, frame_unregistered)
+        # Show total review count in telemetry
+        draw_telemetry(display, fps, frame_total_faces, frame_recognized, frame_unregistered, total_review_count)
         draw_activity_panel(display, activity_log)
         
         cv2.imshow('Attendance - Press q to quit', display)
