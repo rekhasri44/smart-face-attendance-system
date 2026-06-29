@@ -2,10 +2,14 @@ import os
 import numpy as np
 from deepface import DeepFace
 from config import (
-    DATASET_DIR, EMBEDDINGS_CACHE, MODEL_USED,
-    MIN_CONFIDENCE_FOR_REVIEW, HIGH_CONFIDENCE
+    DATASET_DIR, 
+    EMBEDDINGS_CACHE, 
+    MODEL_USED,
+    MIN_CONFIDENCE_FOR_REVIEW,  # ← MUST exist in config.py
+    HIGH_CONFIDENCE             # ← MUST exist in config.py
 )
 from utils import suppress_stdout
+from cache_manager import CacheManager
 
 # Recognition Thresholds
 MIN_CONFIDENCE = 0.50
@@ -14,6 +18,9 @@ MIN_GAP = 0.04
 
 
 def build_embedding_db():
+    """
+    Build embedding database with cache versioning
+    """
     if not os.path.exists(DATASET_DIR):
         raise FileNotFoundError(f"Dataset directory '{DATASET_DIR}' does not exist!")
 
@@ -21,11 +28,26 @@ def build_embedding_db():
     if not people:
         raise ValueError(f"No people directories found in '{DATASET_DIR}'!")
 
-    if os.path.exists(EMBEDDINGS_CACHE):
+    # ── Cache Versioning ──────────────────────────────────────────────────
+    cache_manager = CacheManager(
+        cache_path=EMBEDDINGS_CACHE,
+        metadata_path="cache_metadata.json"
+    )
+    
+    # Check if cache is valid
+    is_valid, reason = cache_manager.is_cache_valid(DATASET_DIR)
+    
+    if is_valid:
+        print(f"✅ Cache is valid: {reason}")
         data = np.load(EMBEDDINGS_CACHE, allow_pickle=True).item()
         if data.get('db') and data.get('people'):
             print(f"✅ Loaded cached embeddings: {len(data['db'])} entries for {len(data['people'])} people.")
+            cache_manager.display_cache_info()
             return data['db'], data['people']
+    else:
+        print(f"🔄 Cache invalid: {reason}")
+        print("🔄 Rebuilding embeddings...")
+    # ────────────────────────────────────────────────────────────────────
 
     print("📂 Building embeddings from dataset...")
 
@@ -55,11 +77,28 @@ def build_embedding_db():
                 skipped_count += 1
 
     people = sorted(list(valid_people))
+    
+    # ── Save cache with metadata ─────────────────────────────────────────
+    # Save the embeddings
     np.save(EMBEDDINGS_CACHE, {'db': db, 'people': people})
-
+    
+    # Build and save metadata
+    cache_size = os.path.getsize(EMBEDDINGS_CACHE) if os.path.exists(EMBEDDINGS_CACHE) else 0
+    metadata = cache_manager.build_metadata(
+        dataset_dir=DATASET_DIR,
+        people=people,
+        embeddings_count=len(db),
+        db_size=cache_size
+    )
+    cache_manager.save_metadata(metadata)
+    
     print(f"✅ Built {len(db)} embeddings for {len(people)} people.")
+    print(f"✅ Saved cache metadata to cache_metadata.json")
     if skipped_count:
         print(f"⚠️  Skipped {skipped_count} invalid images.")
+    
+    cache_manager.display_cache_info()
+    # ────────────────────────────────────────────────────────────────────
 
     return db, people
 
@@ -115,7 +154,7 @@ def recognize_face(face_img, db):
         elif score > second_score:
             second_score = score
 
-    # ── NEW: Check if review is needed ──────────────────────────────────
+    # Check if review is needed
     review_needed = False
     
     # Gate 1: High confidence — accept outright
@@ -125,11 +164,10 @@ def recognize_face(face_img, db):
     # Gate 2: Borderline zone — needs review
     if top_score >= MIN_CONFIDENCE_FOR_REVIEW and top_score < HIGH_CONFIDENCE:
         review_needed = True
-        # Check if there's a significant gap to reject
         if (top_score - second_score) >= MIN_GAP:
-            return top_name, top_score, True  # Needs review but likely correct
+            return top_name, top_score, True
         else:
-            return "Unknown", top_score, True  # Needs review and ambiguous
+            return "Unknown", top_score, True
     
     # Gate 3: Low confidence — reject
     return "Unknown", top_score, False
