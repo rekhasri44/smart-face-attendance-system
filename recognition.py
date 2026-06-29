@@ -1,18 +1,17 @@
-# recognition.py
 import os
 import numpy as np
 from deepface import DeepFace
 from config import (
     DATASET_DIR, EMBEDDINGS_CACHE, MODEL_USED,
-    
+    MIN_CONFIDENCE_FOR_REVIEW, HIGH_CONFIDENCE
 )
 from utils import suppress_stdout
 
 # Recognition Thresholds
+MIN_CONFIDENCE = 0.50
+HIGH_CONFIDENCE = 0.65
+MIN_GAP = 0.04
 
-MIN_CONFIDENCE = 0.50       # Minimum score to even consider a match
-HIGH_CONFIDENCE = 0.65      # Accept without gap check above this
-MIN_GAP = 0.04             # Required margin between top and second match
 
 def build_embedding_db():
     if not os.path.exists(DATASET_DIR):
@@ -26,7 +25,7 @@ def build_embedding_db():
         data = np.load(EMBEDDINGS_CACHE, allow_pickle=True).item()
         if data.get('db') and data.get('people'):
             print(f"✅ Loaded cached embeddings: {len(data['db'])} entries for {len(data['people'])} people.")
-            return data['db'], data['people']  # ← Fixed: removed , []
+            return data['db'], data['people']
 
     print("📂 Building embeddings from dataset...")
 
@@ -62,13 +61,15 @@ def build_embedding_db():
     if skipped_count:
         print(f"⚠️  Skipped {skipped_count} invalid images.")
 
-    return db, people  # ← Fixed: returns only 2 values
+    return db, people
+
 
 def is_live_face(face_img):
     try:
         with suppress_stdout():
             result = DeepFace.analyze(
-                face_img, actions=['emotion'],
+                face_img, 
+                actions=['emotion'],
                 detector_backend='opencv',
                 enforce_detection=True
             )
@@ -79,14 +80,11 @@ def is_live_face(face_img):
 
 def recognize_face(face_img, db):
     """
-    Returns (name, score) or ("Unknown", score) if face doesn't match confidently.
-    Three-gate logic:
-      1. Score >= HIGH_CONFIDENCE → accept (clear match)
-      2. Score >= MIN_CONFIDENCE AND gap >= MIN_GAP → accept (confident + distinct)
-      3. Otherwise → Unknown
+    Returns (name, score, review_needed)
+    review_needed: True if the match is in the borderline zone
     """
     if not is_live_face(face_img):
-        return "Unknown", 0.0
+        return "Unknown", 0.0, False
 
     try:
         rep = DeepFace.represent(
@@ -96,13 +94,13 @@ def recognize_face(face_img, db):
             enforce_detection=True
         )
         if not rep:
-            return "Unknown", 0.0
+            return "Unknown", 0.0, False
 
         face_emb = np.array(rep[0]["embedding"], dtype=np.float32)
         face_emb /= np.linalg.norm(face_emb)
 
     except Exception:
-        return "Unknown", 0.0
+        return "Unknown", 0.0, False
 
     top_name, top_score, second_score = None, -1.0, -1.0
 
@@ -117,14 +115,21 @@ def recognize_face(face_img, db):
         elif score > second_score:
             second_score = score
 
+    # ── NEW: Check if review is needed ──────────────────────────────────
+    review_needed = False
     
     # Gate 1: High confidence — accept outright
     if top_score >= HIGH_CONFIDENCE:
-        return top_name, top_score
-
-    # Gate 2: Confident enough + clearly distinct from next candidate
-    if top_score >= MIN_CONFIDENCE:
-        return top_name, top_score
-
-    # Gate 3: Failed all gates — unknown face
-    return "Unknown", top_score
+        return top_name, top_score, False
+    
+    # Gate 2: Borderline zone — needs review
+    if top_score >= MIN_CONFIDENCE_FOR_REVIEW and top_score < HIGH_CONFIDENCE:
+        review_needed = True
+        # Check if there's a significant gap to reject
+        if (top_score - second_score) >= MIN_GAP:
+            return top_name, top_score, True  # Needs review but likely correct
+        else:
+            return "Unknown", top_score, True  # Needs review and ambiguous
+    
+    # Gate 3: Low confidence — reject
+    return "Unknown", top_score, False
