@@ -6,6 +6,8 @@ Handles all database operations using SQLite
 import sqlite3
 import os
 import pandas as pd
+import base64
+import cv2
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from contextlib import contextmanager
@@ -110,6 +112,36 @@ class DatabaseManager:
                 )
             ''')
             
+            # ── NEW: Review Queue Table ──────────────────────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS review_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id INTEGER,
+                    candidate_name TEXT,
+                    confidence REAL NOT NULL,
+                    face_image_base64 TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    review_status TEXT DEFAULT 'pending',
+                    review_notes TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at DATETIME,
+                    FOREIGN KEY (person_id) REFERENCES people(id)
+                )
+            ''')
+            
+            # ── NEW: Review Log Table ──────────────────────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS review_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    review_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    notes TEXT,
+                    performed_by TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (review_id) REFERENCES review_queue(id)
+                )
+            ''')
+            
             # Create indexes for performance
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_person ON attendance(person_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(session_date)')
@@ -117,6 +149,8 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_permissions_month ON permissions(month)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detection_person ON detection_logs(person_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detection_time ON detection_logs(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(review_status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_review_timestamp ON review_queue(timestamp)')
             
             conn.commit()
     
@@ -132,7 +166,6 @@ class DatabaseManager:
             )
             conn.commit()
             
-            # Get person id
             cursor.execute('SELECT id FROM people WHERE name = ?', (name.strip(),))
             result = cursor.fetchone()
             return result['id'] if result else None
@@ -185,7 +218,6 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Check if record exists
             cursor.execute('''
                 SELECT id FROM attendance 
                 WHERE person_id = ? AND session_date = ?
@@ -194,7 +226,6 @@ class DatabaseManager:
             existing = cursor.fetchone()
             
             if existing:
-                # Update existing record
                 cursor.execute('''
                     UPDATE attendance SET
                         first_seen = COALESCE(first_seen, ?),
@@ -226,7 +257,6 @@ class DatabaseManager:
                     existing['id']
                 ))
             else:
-                # Insert new record
                 cursor.execute('''
                     INSERT INTO attendance (
                         person_id, session_date, first_seen, last_seen,
@@ -356,7 +386,6 @@ class DatabaseManager:
             ''', (remaining, person_id, month))
             
             if cursor.rowcount == 0:
-                # Insert if not exists
                 cursor.execute('''
                     INSERT INTO permissions (person_id, month, remaining)
                     VALUES (?, ?, ?)
@@ -429,6 +458,200 @@ class DatabaseManager:
             ''', (person_id, confidence, time_window, is_recognized))
             conn.commit()
     
+    # ── NEW: Review Queue Operations ──────────────────────────────────────
+    
+    def add_to_review_queue(self, name: str, confidence: float, 
+                           face_image: Optional[np.ndarray] = None,
+                           notes: str = "") -> int:
+        """
+        Add a borderline case to the review queue
+        
+        Args:
+            name: Candidate name (could be guessed)
+            confidence: Recognition confidence score
+            face_image: Cropped face image (optional)
+            notes: Additional notes
+            
+        Returns:
+            review_id: ID of the created review record
+        """
+        person_id = self.get_person_id(name) if name else None
+        
+        # Convert image to base64 if provided
+        image_base64 = None
+        if face_image is not None:
+            try:
+                _, buffer = cv2.imencode('.jpg', face_image)
+                image_base64 = base64.b64encode(buffer).decode('utf-8')
+            except Exception:
+                pass
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO review_queue (
+                    person_id, candidate_name, confidence, 
+                    face_image_base64, review_status, review_notes
+                ) VALUES (?, ?, ?, ?, 'pending', ?)
+            ''', (person_id, name, confidence, image_base64, notes))
+            
+            conn.commit()
+            return cursor.lastrowid
+    
+    def get_pending_reviews(self, limit: int = 50) -> List[Dict]:
+        """Get all pending review items"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 
+                    rq.id,
+                    rq.candidate_name,
+                    rq.confidence,
+                    rq.timestamp,
+                    rq.review_notes,
+                    p.name as actual_name,
+                    rq.face_image_base64
+                FROM review_queue rq
+                LEFT JOIN people p ON rq.person_id = p.id
+                WHERE rq.review_status = 'pending'
+                ORDER BY rq.timestamp ASC
+                LIMIT ?
+            ''', (limit,))
+            
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+    
+    def get_all_reviews(self, status: Optional[str] = None) -> List[Dict]:
+        """Get all review items, optionally filtered by status"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if status:
+                cursor.execute('''
+                    SELECT 
+                        rq.id,
+                        rq.candidate_name,
+                        rq.confidence,
+                        rq.timestamp,
+                        rq.review_status,
+                        rq.review_notes,
+                        rq.reviewed_by,
+                        rq.reviewed_at,
+                        p.name as actual_name
+                    FROM review_queue rq
+                    LEFT JOIN people p ON rq.person_id = p.id
+                    WHERE rq.review_status = ?
+                    ORDER BY rq.timestamp DESC
+                ''', (status,))
+            else:
+                cursor.execute('''
+                    SELECT 
+                        rq.id,
+                        rq.candidate_name,
+                        rq.confidence,
+                        rq.timestamp,
+                        rq.review_status,
+                        rq.review_notes,
+                        rq.reviewed_by,
+                        rq.reviewed_at,
+                        p.name as actual_name
+                    FROM review_queue rq
+                    LEFT JOIN people p ON rq.person_id = p.id
+                    ORDER BY rq.timestamp DESC
+                ''')
+            
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+    
+    def approve_review(self, review_id: int, actual_name: str, 
+                       reviewer: str = "admin", notes: str = "") -> bool:
+        """
+        Approve a review and mark attendance for the person
+        
+        Args:
+            review_id: ID of the review record
+            actual_name: Correct name of the person
+            reviewer: Name of the reviewer
+            notes: Review notes
+        """
+        # Get the person ID
+        person_id = self.get_person_id(actual_name)
+        if person_id is None:
+            person_id = self.add_person(actual_name)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Update review status
+            cursor.execute('''
+                UPDATE review_queue 
+                SET review_status = 'approved',
+                    reviewed_by = ?,
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    review_notes = ?
+                WHERE id = ?
+            ''', (reviewer, notes, review_id))
+            
+            # Log the action
+            cursor.execute('''
+                INSERT INTO review_logs (review_id, action, notes, performed_by)
+                VALUES (?, 'approved', ?, ?)
+            ''', (review_id, notes, reviewer))
+            
+            # Mark attendance for today
+            today = datetime.now().strftime("%Y-%m-%d")
+            cursor.execute('''
+                INSERT OR REPLACE INTO attendance 
+                (person_id, session_date, final_status)
+                VALUES (?, ?, 'Present (Manual Review)')
+            ''', (person_id, today))
+            
+            conn.commit()
+            return True
+    
+    def reject_review(self, review_id: int, reviewer: str = "admin", 
+                     notes: str = "") -> bool:
+        """Reject a review"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE review_queue 
+                SET review_status = 'rejected',
+                    reviewed_by = ?,
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    review_notes = ?
+                WHERE id = ?
+            ''', (reviewer, notes, review_id))
+            
+            cursor.execute('''
+                INSERT INTO review_logs (review_id, action, notes, performed_by)
+                VALUES (?, 'rejected', ?, ?)
+            ''', (review_id, notes, reviewer))
+            
+            conn.commit()
+            return True
+    
+    def get_review_statistics(self) -> Dict:
+        """Get statistics about the review queue"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN review_status = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) as approved,
+                    SUM(CASE WHEN review_status = 'rejected' THEN 1 ELSE 0 END) as rejected,
+                    AVG(confidence) as avg_confidence
+                FROM review_queue
+            ''')
+            
+            stats = cursor.fetchone()
+            return dict(stats) if stats else {
+                'total': 0, 'pending': 0, 'approved': 0, 'rejected': 0, 'avg_confidence': 0
+            }
+    
     # ── Export Operations (Backward Compatibility) ──────────────────────
     
     def export_attendance_to_csv(self, filepath: str):
@@ -463,7 +686,6 @@ class DatabaseManager:
         """Migrate data from CSV files to SQLite database"""
         print("🔄 Starting migration from CSV to SQLite...")
         
-        # Migrate people and attendance
         if os.path.exists(attendance_csv):
             df = pd.read_csv(attendance_csv)
             for _, row in df.iterrows():
@@ -485,7 +707,6 @@ class DatabaseManager:
                 self.save_attendance(name, data)
             print(f"✅ Migrated {len(df)} attendance records")
         
-        # Migrate permissions
         if os.path.exists(permissions_csv):
             df = pd.read_csv(permissions_csv)
             for _, row in df.iterrows():
@@ -495,7 +716,6 @@ class DatabaseManager:
                 self.save_permission(name, month, remaining)
             print(f"✅ Migrated {len(df)} permission records")
         
-        # Migrate contacts
         if os.path.exists(contacts_csv):
             df = pd.read_csv(contacts_csv)
             for _, row in df.iterrows():
