@@ -8,8 +8,9 @@ import os
 import pandas as pd
 import base64
 import cv2
+import numpy as np
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from contextlib import contextmanager
 
 
@@ -37,11 +38,11 @@ class DatabaseManager:
             conn.close()
     
     def _initialize_database(self):
-        """Create tables if they don't exist"""
+        """Create all tables if they don't exist"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Create people table
+            # ── People Table ──────────────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS people (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +51,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create attendance table
+            # ── Attendance Table ─────────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS attendance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +75,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create permissions table
+            # ── Permissions Table ────────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS permissions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +90,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create contacts table
+            # ── Contacts Table ───────────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS contacts (
                     person_id INTEGER PRIMARY KEY,
@@ -99,7 +100,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create detection logs for analytics
+            # ── Detection Logs Table (Analytics) ────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS detection_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +113,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # ── NEW: Review Queue Table ──────────────────────────────────────
+            # ── Review Queue Table ───────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS review_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +130,7 @@ class DatabaseManager:
                 )
             ''')
             
-            # ── NEW: Review Log Table ──────────────────────────────────────
+            # ── Review Logs Table ────────────────────────────────────────────
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS review_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,7 +143,46 @@ class DatabaseManager:
                 )
             ''')
             
-            # Create indexes for performance
+            # ── Analytics Summary Table ──────────────────────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analytics_summary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date DATE NOT NULL,
+                    total_detections INTEGER DEFAULT 0,
+                    successful_recognitions INTEGER DEFAULT 0,
+                    failed_recognitions INTEGER DEFAULT 0,
+                    unknown_faces INTEGER DEFAULT 0,
+                    review_queue_entries INTEGER DEFAULT 0,
+                    avg_confidence REAL DEFAULT 0,
+                    min_confidence REAL DEFAULT 0,
+                    max_confidence REAL DEFAULT 0,
+                    total_attendance INTEGER DEFAULT 0,
+                    full_attendance INTEGER DEFAULT 0,
+                    half_attendance INTEGER DEFAULT 0,
+                    absent INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date)
+                )
+            ''')
+            
+            # ── Daily Stats Table ────────────────────────────────────────────
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    detections INTEGER DEFAULT 0,
+                    avg_confidence REAL DEFAULT 0,
+                    first_seen DATETIME,
+                    last_seen DATETIME,
+                    total_time_seconds REAL DEFAULT 0,
+                    status TEXT DEFAULT 'Absent',
+                    FOREIGN KEY (person_id) REFERENCES people(id),
+                    UNIQUE(person_id, date)
+                )
+            ''')
+            
+            # ── Indexes for Performance ──────────────────────────────────────
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_person ON attendance(person_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(session_date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_permissions_person ON permissions(person_id)')
@@ -151,6 +191,9 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_detection_time ON detection_logs(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(review_status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_review_timestamp ON review_queue(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_summary(date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_dailystats_person ON daily_stats(person_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_dailystats_date ON daily_stats(date)')
             
             conn.commit()
     
@@ -201,7 +244,7 @@ class DatabaseManager:
     
     # ── Attendance Operations ──────────────────────────────────────────────
     
-    def save_attendance(self, name: str, data: Dict) -> bool:
+    def save_attendance(self, name: str, data: Dict[str, Any]) -> bool:
         """
         Save or update attendance record for a person
         
@@ -242,7 +285,7 @@ class DatabaseManager:
                         permission_afternoon_used = ?
                     WHERE id = ?
                 ''', (
-                    data.get('morning_first_seen'),
+                    data.get('first_seen'),
                     data.get('last_seen'),
                     data.get('total_seconds', 0),
                     data.get('morning_status'),
@@ -393,7 +436,7 @@ class DatabaseManager:
             
             conn.commit()
     
-    def get_all_permissions(self) -> Dict:
+    def get_all_permissions(self) -> Dict[Tuple[str, str], int]:
         """Get all permissions as dictionary"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -458,7 +501,7 @@ class DatabaseManager:
             ''', (person_id, confidence, time_window, is_recognized))
             conn.commit()
     
-    # ── NEW: Review Queue Operations ──────────────────────────────────────
+    # ── Review Queue Operations ──────────────────────────────────────────
     
     def add_to_review_queue(self, name: str, confidence: float, 
                            face_image: Optional[np.ndarray] = None,
@@ -498,7 +541,7 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
     
-    def get_pending_reviews(self, limit: int = 50) -> List[Dict]:
+    def get_pending_reviews(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Get all pending review items"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -521,7 +564,7 @@ class DatabaseManager:
             results = cursor.fetchall()
             return [dict(row) for row in results]
     
-    def get_all_reviews(self, status: Optional[str] = None) -> List[Dict]:
+    def get_all_reviews(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all review items, optionally filtered by status"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -574,7 +617,6 @@ class DatabaseManager:
             reviewer: Name of the reviewer
             notes: Review notes
         """
-        # Get the person ID
         person_id = self.get_person_id(actual_name)
         if person_id is None:
             person_id = self.add_person(actual_name)
@@ -582,7 +624,6 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Update review status
             cursor.execute('''
                 UPDATE review_queue 
                 SET review_status = 'approved',
@@ -592,13 +633,11 @@ class DatabaseManager:
                 WHERE id = ?
             ''', (reviewer, notes, review_id))
             
-            # Log the action
             cursor.execute('''
                 INSERT INTO review_logs (review_id, action, notes, performed_by)
                 VALUES (?, 'approved', ?, ?)
             ''', (review_id, notes, reviewer))
             
-            # Mark attendance for today
             today = datetime.now().strftime("%Y-%m-%d")
             cursor.execute('''
                 INSERT OR REPLACE INTO attendance 
@@ -632,7 +671,7 @@ class DatabaseManager:
             conn.commit()
             return True
     
-    def get_review_statistics(self) -> Dict:
+    def get_review_statistics(self) -> Dict[str, Any]:
         """Get statistics about the review queue"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -651,6 +690,51 @@ class DatabaseManager:
             return dict(stats) if stats else {
                 'total': 0, 'pending': 0, 'approved': 0, 'rejected': 0, 'avg_confidence': 0
             }
+    
+    # ── Analytics Operations ──────────────────────────────────────────────
+    
+    def update_analytics_summary(self, date: str, stats: Dict[str, Any]):
+        """Update or insert analytics summary for a date"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO analytics_summary (
+                    date, total_detections, successful_recognitions,
+                    failed_recognitions, unknown_faces, review_queue_entries,
+                    avg_confidence, min_confidence, max_confidence,
+                    total_attendance, full_attendance, half_attendance, absent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                date,
+                stats.get('total_detections', 0),
+                stats.get('successful_recognitions', 0),
+                stats.get('failed_recognitions', 0),
+                stats.get('unknown_faces', 0),
+                stats.get('review_queue_entries', 0),
+                stats.get('avg_confidence', 0),
+                stats.get('min_confidence', 0),
+                stats.get('max_confidence', 0),
+                stats.get('total_attendance', 0),
+                stats.get('full_attendance', 0),
+                stats.get('half_attendance', 0),
+                stats.get('absent', 0)
+            ))
+            
+            conn.commit()
+    
+    def get_analytics_summary(self, date: Optional[str] = None) -> Dict[str, Any]:
+        """Get analytics summary for a specific date"""
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM analytics_summary WHERE date = ?
+            ''', (date,))
+            result = cursor.fetchone()
+            return dict(result) if result else {}
     
     # ── Export Operations (Backward Compatibility) ──────────────────────
     
@@ -680,12 +764,24 @@ class DatabaseManager:
         df.to_csv(filepath, index=False)
         print(f"✅ Exported contacts to {filepath}")
     
+    def export_all_to_csv(self, output_dir: str = "exports"):
+        """Export all data to CSV files"""
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        self.export_attendance_to_csv(f"{output_dir}/attendance_{timestamp}.csv")
+        self.export_permissions_to_csv(f"{output_dir}/permissions_{timestamp}.csv")
+        self.export_contacts_to_csv(f"{output_dir}/contacts_{timestamp}.csv")
+        
+        print(f"✅ All exports saved to: {output_dir}/")
+    
     # ── Migration from CSV ──────────────────────────────────────────────────
     
     def migrate_from_csv(self, attendance_csv: str, permissions_csv: str, contacts_csv: str):
         """Migrate data from CSV files to SQLite database"""
         print("🔄 Starting migration from CSV to SQLite...")
         
+        # Migrate people and attendance
         if os.path.exists(attendance_csv):
             df = pd.read_csv(attendance_csv)
             for _, row in df.iterrows():
@@ -707,6 +803,7 @@ class DatabaseManager:
                 self.save_attendance(name, data)
             print(f"✅ Migrated {len(df)} attendance records")
         
+        # Migrate permissions
         if os.path.exists(permissions_csv):
             df = pd.read_csv(permissions_csv)
             for _, row in df.iterrows():
@@ -716,6 +813,7 @@ class DatabaseManager:
                 self.save_permission(name, month, remaining)
             print(f"✅ Migrated {len(df)} permission records")
         
+        # Migrate contacts
         if os.path.exists(contacts_csv):
             df = pd.read_csv(contacts_csv)
             for _, row in df.iterrows():
