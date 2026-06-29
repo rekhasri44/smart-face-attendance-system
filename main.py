@@ -11,7 +11,9 @@ from config import (
     AFTERNOON_PERMISSION_START, MORNING_PERMISSION_START,
     QUIT_TIME_START, QUIT_TIME_END,
     LIVENESS_ENABLED, EAR_THRESHOLD, BLINK_CONSECUTIVE_FRAMES,
-    REQUIRED_BLINKS, LIVENESS_DETECTION_WINDOW
+    REQUIRED_BLINKS, LIVENESS_DETECTION_WINDOW,
+    ENABLE_CHALLENGES, HEAD_MOVEMENT_THRESHOLD,
+    CHALLENGE_TIMEOUT, CHALLENGES_REQUIRED
 )
 from recognition import build_embedding_db, recognize_face
 from attendance import (
@@ -157,21 +159,26 @@ def run_attendance():
     consecutive_detects = {name: 0 for name in people}
     cooldown_until = {name: None for name in people}
 
-    # ── Liveness Detection Initialization ──────────────────────────────────
+    # ── Liveness Detection Initialization with Challenges ──────────────────
     if LIVENESS_ENABLED:
         blink_detector = BlinkDetector(
             ear_threshold=EAR_THRESHOLD,
             consecutive_frames=BLINK_CONSECUTIVE_FRAMES,
             required_blinks=REQUIRED_BLINKS,
-            detection_window=LIVENESS_DETECTION_WINDOW
+            detection_window=LIVENESS_DETECTION_WINDOW,
+            head_movement_threshold=HEAD_MOVEMENT_THRESHOLD,
+            challenge_timeout=CHALLENGE_TIMEOUT
         )
         liveness_verified = {name: False for name in people}
         liveness_last_verified_time = {name: None for name in people}
-        print("✅ Liveness detection enabled - blink to verify")
+        person_challenges_completed = {name: 0 for name in people}
+        print("✅ Liveness detection with challenges enabled")
+        print(f"🎯 Complete {CHALLENGES_REQUIRED} challenges (blink + head movement)")
     else:
         blink_detector = None
         liveness_verified = {name: True for name in people}
         liveness_last_verified_time = {name: datetime.now() for name in people}
+        person_challenges_completed = {name: 0 for name in people}
         print("⚠️  Liveness detection disabled")
     # ───────────────────────────────────────────────────────────────────────
 
@@ -207,9 +214,30 @@ def run_attendance():
         now = datetime.now()
         now_t = now.time()
 
-        # ── Liveness detection on full frame ──────────────────────────────
+        # ── Liveness detection with challenges on full frame ──────────────
         if LIVENESS_ENABLED and blink_detector:
-            live_status, display = blink_detector.process_frame(frame)
+            # Process with challenges enabled
+            live_status, display, challenge_text = blink_detector.process_frame(
+                frame, 
+                enable_challenges=ENABLE_CHALLENGES
+            )
+            
+            # Display challenge text on frame
+            if challenge_text and not live_status:
+                # Draw challenge instruction at bottom
+                cv2.rectangle(display, (10, display.shape[0] - 70), 
+                             (display.shape[1] - 10, display.shape[0] - 10),
+                             (0, 0, 0), -1)
+                cv2.putText(
+                    display,
+                    f"🎯 {challenge_text}",
+                    (20, display.shape[0] - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA
+                )
             
             if live_status:
                 for name in people:
@@ -218,7 +246,8 @@ def run_attendance():
                             if not liveness_verified[name]:
                                 liveness_verified[name] = True
                                 liveness_last_verified_time[name] = now
-                                activity_log.append((now, f"👁 Liveness OK - {name}", (0, 255, 0)))
+                                person_challenges_completed[name] = CHALLENGES_REQUIRED
+                                activity_log.append((now, f"✅ Liveness Passed - {name}", (0, 255, 0)))
         # ───────────────────────────────────────────────────────────────────
 
         if frame_count % FRAME_SKIP == 0:
@@ -277,6 +306,11 @@ def run_attendance():
                     is_live = liveness_verified.get(name, False)
                     liveness_status = "✓" if is_live else "⏳"
                     
+                    # Show challenge progress
+                    if LIVENESS_ENABLED and not is_live:
+                        completed = person_challenges_completed.get(name, 0)
+                        liveness_status = f"🎯 {completed}/{CHALLENGES_REQUIRED}"
+                    
                     label_text = f"{name} ({score:.2f}) {duration:.1f}s {liveness_status}"
                     cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
                     draw_label(display, label_text, x, y, color)
@@ -294,13 +328,15 @@ def run_attendance():
                     if cooldown_until.get(name) and now < cooldown_until.get(name):
                         if name not in last_activity_time or \
                            (now - last_activity_time[name]).total_seconds() > ACTIVITY_COOLDOWN:
-                            activity_log.append((now, f"✓ {name} {liveness_status}", (0, 255, 180)))
+                            status_icon = "✅" if is_live else "⏳"
+                            activity_log.append((now, f"{status_icon} {name} {liveness_status}", (0, 255, 180)))
                             last_activity_time[name] = now
 
                     if name not in names_already_assigned:
                         names_already_assigned.add(name)
                         consecutive_detects[name] += 1
 
+                        # Only mark attendance if liveness verified
                         if (consecutive_detects[name] >= CONSEC_DETECTS_REQUIRED and is_live):
                             
                             record = attendance[name]
@@ -351,8 +387,12 @@ def run_attendance():
                     if LIVENESS_ENABLED and last_seen[name]:
                         if (now - last_seen[name]).total_seconds() > 5:
                             if liveness_verified[name] and liveness_last_verified_time[name]:
-                                if (now - liveness_last_verified_time[name]).total_seconds() > 10:
+                                if (now - liveness_last_verified_time[name]).total_seconds() > 30:
                                     liveness_verified[name] = False
+                                    person_challenges_completed[name] = 0
+                                    # Reset detector for this person
+                                    if blink_detector:
+                                        blink_detector.reset()
 
             for name in people:
                 if in_session[name] and last_seen[name]:
