@@ -13,7 +13,7 @@ CACHE_METADATA = "cache_metadata.json"
 CONTACTS_CSV = "contacts.csv"
 
 # ── Database ───────────────────────────────────────────────────────────────
-DATABASE_PATH = "attendance.db"
+DATABASE_PATH = "attendance.db"   # <-- ADD THIS
 USE_DATABASE = True
 
 # ── Cache Configuration ────────────────────────────────────────────────────
