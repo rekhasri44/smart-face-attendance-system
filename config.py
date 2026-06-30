@@ -9,11 +9,17 @@ DATASET_DIR = "dataset"
 ATTENDANCE_CSV = "attendance_log.csv"
 PERMISSIONS_CSV = "permissions_log.csv"
 EMBEDDINGS_CACHE = "embeddings_cache.npy"
+CACHE_METADATA = "cache_metadata.json"
 CONTACTS_CSV = "contacts.csv"
 
 # ── Database ───────────────────────────────────────────────────────────────
 DATABASE_PATH = "attendance.db"
-USE_DATABASE = True  # Set to True to use SQLite, False to use CSV
+USE_DATABASE = True
+
+# ── Cache Configuration ────────────────────────────────────────────────────
+CACHE_VERSION = "1.0"
+AUTO_REBUILD_CACHE = True
+CACHE_WARNING_DAYS = 30
 
 # ── Recognition ────────────────────────────────────────────────────────────
 RECOGNITION_THRESHOLD = 0.6
@@ -26,10 +32,10 @@ MAX_PEOPLE_PER_FRAME = 10
 PERMISSIONS_PER_MONTH = 5
 
 # ── Review Queue Configuration ────────────────────────────────────────────
-MIN_CONFIDENCE_FOR_REVIEW = 0.45      # Below this: reject immediately
-HIGH_CONFIDENCE = 0.65                # Above this: auto-accept
-REVIEW_QUEUE_ENABLED = True           # Enable/disable review queue
-MAX_REVIEW_ATTEMPTS = 3               # Max review attempts per session
+MIN_CONFIDENCE_FOR_REVIEW = 0.45
+HIGH_CONFIDENCE = 0.65
+REVIEW_QUEUE_ENABLED = True
+MAX_REVIEW_ATTEMPTS = 3
 
 # ── Email credentials (loaded from .env) ──────────────────────────────────
 SENDER_EMAIL = os.getenv("EMAIL", "")
