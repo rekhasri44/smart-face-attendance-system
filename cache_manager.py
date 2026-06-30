@@ -8,7 +8,6 @@ import json
 import hashlib
 from datetime import datetime
 
-
 class CacheManager:
     """Manages embedding cache with versioning and validation"""
     
