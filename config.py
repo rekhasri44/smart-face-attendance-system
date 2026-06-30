@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Paths ──────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────
 DATASET_DIR = "dataset"
 ATTENDANCE_CSV = "attendance_log.csv"
 PERMISSIONS_CSV = "permissions_log.csv"
