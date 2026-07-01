@@ -2,6 +2,8 @@ import cv2
 import pandas as pd
 import collections
 from datetime import datetime, time, timedelta
+from camera_manager import CameraManager
+from config import CAMERA_CONFIG, ACTIVE_CAMERAS, CAMERA_FRAME_SKIP, CAMERA_SWITCH_INTERVAL
 
 from config import (
     ATTENDANCE_CSV, FRAME_SKIP, CONSEC_DETECTS_REQUIRED,
