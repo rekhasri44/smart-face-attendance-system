@@ -75,3 +75,14 @@ MAX_CHALLENGE_ATTEMPTS = 3
 # ── MediaPipe Settings ─────────────────────────────────────────────────────
 MEDIAPIPE_MIN_DETECTION_CONFIDENCE = 0.5
 MEDIAPIPE_MIN_TRACKING_CONFIDENCE = 0.5
+
+# ── Multi-Camera Configuration ─────────────────────────────────────────────
+CAMERA_CONFIG = {
+    'main': {'index': 0, 'name': 'Main Entrance'},
+    'side': {'index': 1, 'name': 'Side Entrance'},
+    # Add more cameras as needed: 'camera2': {'index': 2, 'name': 'Back Door'}
+}
+
+ACTIVE_CAMERAS = ['main']  # Which cameras to use
+CAMERA_FRAME_SKIP = 2      # Process every Nth frame per camera
+CAMERA_SWITCH_INTERVAL = 5 # Seconds between camera switching
