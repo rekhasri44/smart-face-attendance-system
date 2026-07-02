@@ -13,7 +13,8 @@ from config import (
     LIVENESS_ENABLED, EAR_THRESHOLD, BLINK_CONSECUTIVE_FRAMES,
     REQUIRED_BLINKS, LIVENESS_DETECTION_WINDOW,
     ENABLE_CHALLENGES, HEAD_MOVEMENT_THRESHOLD,
-    CHALLENGE_TIMEOUT, CHALLENGES_REQUIRED
+    CHALLENGE_TIMEOUT, CHALLENGES_REQUIRED,
+    CAMERA_CONFIG, ACTIVE_CAMERAS, CAMERA_FRAME_SKIP, CAMERA_SWITCH_INTERVAL
 )
 from recognition import build_embedding_db, recognize_face
 from attendance import (
@@ -23,6 +24,7 @@ from attendance import (
 from email_service import notify_all
 from utils import draw_label, safe_to_csv, FaceStabilizer
 from liveness import BlinkDetector
+from camera_manager import CameraManager
 
 # Try to import database module - handle gracefully if not available
 try:
@@ -34,16 +36,6 @@ except ImportError:
 
 # Cooldown constant
 ATTENDANCE_COOLDOWN_SECONDS = 10
-
-def try_open_webcam():
-    for idx in range(3):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if hasattr(cv2, 'CAP_DSHOW') else 0)
-        if cap.isOpened():
-            print(f"✅ Webcam opened on index {idx}.")
-            return cap
-        cap.release()
-    print("❌ Webcam not accessible.")
-    return None
 
 def init_attendance(people):
     return {
@@ -67,7 +59,7 @@ def init_attendance(people):
         for name in people
     }
 
-def draw_telemetry(frame, fps, total_faces, recognized, unregistered, review_count=0):
+def draw_telemetry(frame, fps, total_faces, recognized, unregistered, review_count=0, camera_info=""):
     lines = [
         f"FPS: {fps:.1f}",
         f"Faces: {total_faces}",
@@ -79,7 +71,7 @@ def draw_telemetry(frame, fps, total_faces, recognized, unregistered, review_cou
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale, thickness = 0.6, 1
 
-    panel_w, panel_h = 180, line_height * len(lines) + 10
+    panel_w, panel_h = 220, line_height * len(lines) + 10
     overlay = frame.copy()
     cv2.rectangle(overlay, (5, 5), (5 + panel_w, 5 + panel_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
@@ -87,6 +79,11 @@ def draw_telemetry(frame, fps, total_faces, recognized, unregistered, review_cou
     for i, line in enumerate(lines):
         y = y_start + i * line_height
         cv2.putText(frame, line, (x, y), font, scale, (0, 255, 180), thickness, cv2.LINE_AA)
+    
+    # Add camera info at bottom
+    if camera_info:
+        cv2.putText(frame, camera_info, (10, frame.shape[0] - 10), 
+                   font, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
 
 def draw_activity_panel(frame, activity_log):
     if not activity_log:
@@ -139,25 +136,41 @@ def check_face_quality(x, y, w, h, frame_w, frame_h):
     return True, None
 
 def run_attendance():
-    print("📷 Opening webcam...")
-    cap = try_open_webcam()
-    if cap is None:
+    print("📷 Initializing cameras...")
+    camera_manager = CameraManager(
+        camera_config=CAMERA_CONFIG,
+        active_cameras=ACTIVE_CAMERAS,
+        frame_skip=CAMERA_FRAME_SKIP
+    )
+
+    if not camera_manager.cameras:
+        print("❌ No cameras available.")
         return
 
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    camera_manager.display_camera_info()
+    
+    # Get first frame to get dimensions
+    first_frame, _, _ = camera_manager.get_next_frame()
+    if first_frame is None:
+        print("❌ Could not get frame from any camera.")
+        camera_manager.release_all()
+        return
+    
+    frame_h, frame_w = first_frame.shape[:2]
     print(f"📐 Frame dimensions: {frame_w}x{frame_h}")
 
     webcam_start = datetime.now().strftime("%H:%M:%S")
 
     try:
-        embedding_db, people = build_embedding_db()  # Renamed to embedding_db
+        embedding_db, people = build_embedding_db()
     except Exception as e:
         print(f"❌ Dataset error: {e}")
+        camera_manager.release_all()
         return
 
     if not embedding_db or not people:
         print("❌ No embeddings loaded.")
+        camera_manager.release_all()
         return
 
     attendance = init_attendance(people)
@@ -214,6 +227,7 @@ def run_attendance():
     frame_recognized = 0
     frame_unregistered = 0
     total_review_count = 0  # Track total reviews across all frames
+    current_camera = ""
 
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -226,10 +240,21 @@ def run_attendance():
         if len(frame_times) >= 2:
             fps = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
         
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Frame read failed.")
-            break
+        # Get frame from camera manager
+        frame, cam_key, stats = camera_manager.get_next_frame()
+        
+        if frame is None:
+            # Try switching camera if no frame
+            if camera_manager.switch_camera():
+                print(f"🔄 Switched to next camera")
+                continue
+            else:
+                print("❌ No camera available, exiting...")
+                break
+        
+        # Update current camera info
+        current_camera = cam_key
+        cam_fps = stats.get('fps', 0) if stats else 0
 
         display = frame.copy()
         now = datetime.now()
@@ -469,8 +494,11 @@ def run_attendance():
 
         frame_count += 1
         
+        # Prepare camera info for telemetry
+        camera_info = f"Camera: {current_camera} | Cam FPS: {cam_fps:.1f}"
+        
         # Show total review count in telemetry
-        draw_telemetry(display, fps, frame_total_faces, frame_recognized, frame_unregistered, total_review_count)
+        draw_telemetry(display, fps, frame_total_faces, frame_recognized, frame_unregistered, total_review_count, camera_info)
         draw_activity_panel(display, activity_log)
         
         cv2.imshow('Attendance - Press q to quit', display)
@@ -479,7 +507,7 @@ def run_attendance():
             break
 
     webcam_end = datetime.now().strftime("%H:%M:%S")
-    cap.release()
+    camera_manager.release_all()
     cv2.destroyAllWindows()
 
     now = datetime.now()
