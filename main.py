@@ -36,6 +36,7 @@ except ImportError:
 
 # Cooldown constant
 ATTENDANCE_COOLDOWN_SECONDS = 10
+DUPLICATE_TIMEOUT = 60  # seconds to prevent duplicate markings
 
 def init_attendance(people):
     return {
@@ -180,6 +181,10 @@ def run_attendance():
     interval_open = {name: None for name in people}
     consecutive_detects = {name: 0 for name in people}
     cooldown_until = {name: None for name in people}
+    
+    # ── Duplicate Detection Prevention Cache ──────────────────────────────
+    marked_attendance_cache = {}  # {(name, date): timestamp}
+    # ───────────────────────────────────────────────────────────────────────
 
     # ── Liveness Detection Initialization with Challenges ──────────────────
     if LIVENESS_ENABLED:
@@ -424,6 +429,19 @@ def run_attendance():
                         # Only mark attendance if liveness verified
                         if (consecutive_detects[name] >= CONSEC_DETECTS_REQUIRED and is_live):
                             
+                            # ── Duplicate Detection Prevention ──────────────────
+                            # Check if attendance was already marked recently
+                            attendance_key = (name, datetime.now().strftime("%Y-%m-%d"))
+                            
+                            if attendance_key in marked_attendance_cache:
+                                last_mark = marked_attendance_cache[attendance_key]
+                                if (datetime.now() - last_mark).total_seconds() < DUPLICATE_TIMEOUT:
+                                    # Skip duplicate - already marked recently
+                                    # Still update last_seen to keep session active
+                                    last_seen[name] = now
+                                    continue
+                            # ──────────────────────────────────────────────────────
+                            
                             record = attendance[name]
                             if not in_session[name]:
                                 interval_open[name] = now
@@ -432,7 +450,16 @@ def run_attendance():
                                 
                                 if cooldown_until[name] is None or now >= cooldown_until[name]:
                                     cooldown_until[name] = now + timedelta(seconds=ATTENDANCE_COOLDOWN_SECONDS)
-                                
+                            
+                            # Mark attendance in cache
+                            marked_attendance_cache[attendance_key] = now
+                            
+                            # Clean up old cache entries (older than 24 hours)
+                            current_date = datetime.now().strftime("%Y-%m-%d")
+                            for key in list(marked_attendance_cache.keys()):
+                                if key[1] != current_date:
+                                    del marked_attendance_cache[key]
+                            
                             last_seen[name] = now
                             attendance[name]["detected_frames"] += 1
                             record["detections"].append(now)
