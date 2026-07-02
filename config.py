@@ -86,3 +86,9 @@ CAMERA_CONFIG = {
 ACTIVE_CAMERAS = ['main']  # Which cameras to use
 CAMERA_FRAME_SKIP = 2      # Process every Nth frame per camera
 CAMERA_SWITCH_INTERVAL = 5 # Seconds between camera switching
+
+
+# ── Benchmark Configuration ───────────────────────────────────────────────
+BENCHMARK_FRAMES = 50
+BENCHMARK_OUTPUT_DIR = "benchmark_reports"
+BENCHMARK_DETECTORS = ['haar', 'mtcnn', 'retinaface']  # Available detectors
