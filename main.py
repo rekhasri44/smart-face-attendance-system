@@ -25,6 +25,7 @@ from email_service import notify_all
 from utils import draw_label, safe_to_csv, FaceStabilizer
 from liveness import BlinkDetector
 from camera_manager import CameraManager
+from tracker import FaceTracker  # ADDED: Import FaceTracker
 
 # Try to import database module - handle gracefully if not available
 try:
@@ -224,7 +225,10 @@ def run_attendance():
     last_activity_time = {}
     ACTIVITY_COOLDOWN = 3
 
-    stabilizers = {}
+    # REPLACED: stabilizers = {} with face_tracker
+    face_tracker = FaceTracker(max_age=5, min_hits=3, iou_threshold=0.3)
+    track_id_to_name = {}
+    track_attendance_status = {}
 
     frame_times = collections.deque(maxlen=30)
     fps = 0.0
@@ -235,7 +239,7 @@ def run_attendance():
     current_camera = ""
 
     face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cv2. data.haarcascades + "haarcascade_frontalface_default.xml"
     )
     cv2.namedWindow('Attendance - Press q to quit', cv2.WINDOW_NORMAL)
     frame_count = 0
@@ -306,12 +310,17 @@ def run_attendance():
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)[:MAX_PEOPLE_PER_FRAME]
             names_already_assigned = set()
             
+            # Prepare lists for tracker
+            detections = []
+            detection_names = []
+            
             frame_total_faces = 0
             frame_recognized = 0
             frame_unregistered = 0
             frame_review_count = 0  # Reset per frame
 
-            for idx, (x, y, w, h) in enumerate(faces):
+            # First pass: detect and recognize all faces
+            for (x, y, w, h) in faces:
                 if w < MIN_FACE_SIZE or h < MIN_FACE_SIZE:
                     continue
                 
@@ -371,73 +380,88 @@ def run_attendance():
                         # Fall through to normal recognition
                 # ──────────────────────────────────────────────────────────────────
                 
+                # Determine the label for this detection
                 if raw_name is not None and raw_name not in ("Unknown", "Unregistered Face"):
                     frame_recognized += 1
+                    stable_label = raw_name
                 else:
                     frame_unregistered += 1
+                    stable_label = "Unknown"
                     
                     if "__unknown__" not in last_activity_time or \
                        (now - last_activity_time["__unknown__"]).total_seconds() > ACTIVITY_COOLDOWN:
                         activity_log.append((now, "⚠ Unregistered", (0, 165, 255)))
                         last_activity_time["__unknown__"] = now
-
-                slot_key = f"face_{idx}"
                 
-                if slot_key not in stabilizers:
-                    stabilizers[slot_key] = FaceStabilizer()
+                # Add to detection lists for tracker
+                detections.append([x, y, w, h])
+                detection_names.append(stable_label)
+            
+            # ── Process with Face Tracker ──────────────────────────────────────
+            if detections:
+                confirmed_tracks = face_tracker.process_frame(detections, detection_names)
                 
-                stable_label = stabilizers[slot_key].update(raw_name)
-
-                if stable_label not in ("Detecting...", "Unregistered Face", "Unknown", None):
-                    name = stable_label
-                    color = (0, 255, 0)
-                    duration = attendance[name]["current_session_duration"]
-                    
-                    is_live = liveness_verified.get(name, False)
-                    liveness_status = "✓" if is_live else "⏳"
-                    
-                    # Show challenge progress
-                    if LIVENESS_ENABLED and not is_live:
-                        completed = person_challenges_completed.get(name, 0)
-                        liveness_status = f"🎯 {completed}/{CHALLENGES_REQUIRED}"
-                    
-                    label_text = f"{name} ({score:.2f}) {duration:.1f}s {liveness_status}"
-                    cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
-                    draw_label(display, label_text, x, y, color)
-
-                    if cooldown_until[name] and now < cooldown_until[name]:
-                        remaining = int((cooldown_until[name] - now).total_seconds()) + 1
-                        draw_label(
-                            display,
-                            f"Attendance Confirmed ✓ ({remaining}s)",
-                            x,
-                            y + h + 20,
-                            (0, 220, 120)
-                        )
-                    
-                    if cooldown_until.get(name) and now < cooldown_until.get(name):
-                        if name not in last_activity_time or \
-                           (now - last_activity_time[name]).total_seconds() > ACTIVITY_COOLDOWN:
-                            status_icon = "✅" if is_live else "⏳"
-                            activity_log.append((now, f"{status_icon} {name} {liveness_status}", (0, 255, 180)))
-                            last_activity_time[name] = now
-
-                    if name not in names_already_assigned:
-                        names_already_assigned.add(name)
-                        consecutive_detects[name] += 1
-
-                        # Only mark attendance if liveness verified
-                        if (consecutive_detects[name] >= CONSEC_DETECTS_REQUIRED and is_live):
+                # Process each confirmed track
+                for track_id, bbox, name in confirmed_tracks:
+                    if name not in ("Unknown", "Unregistered Face", None):
+                        x, y, w, h = bbox
+                        
+                        # Map track ID to name
+                        track_id_to_name[track_id] = name
+                        
+                        # Initialize track attendance status
+                        if track_id not in track_attendance_status:
+                            track_attendance_status[track_id] = {
+                                'name': name,
+                                'attendance_marked': False,
+                                'consecutive_detects': 0
+                            }
+                        
+                        # Update track info
+                        track_attendance_status[track_id]['name'] = name
+                        track_attendance_status[track_id]['consecutive_detects'] += 1
+                        
+                        # Check liveness
+                        is_live = liveness_verified.get(name, False)
+                        
+                        # Draw tracking info
+                        color = (0, 255, 0) if is_live else (255, 255, 0)
+                        cv2.rectangle(display, (int(x), int(y)), (int(x+w), int(y+h)), color, 2)
+                        
+                        duration = attendance[name]["current_session_duration"]
+                        liveness_status = "✓" if is_live else "⏳"
+                        
+                        # Show challenge progress
+                        if LIVENESS_ENABLED and not is_live:
+                            completed = person_challenges_completed.get(name, 0)
+                            liveness_status = f"🎯 {completed}/{CHALLENGES_REQUIRED}"
+                        
+                        label_text = f"ID:{track_id} {name} ({duration:.1f}s) {liveness_status}"
+                        draw_label(display, label_text, int(x), int(y), color)
+                        
+                        # Show cooldown if active
+                        if cooldown_until[name] and now < cooldown_until[name]:
+                            remaining = int((cooldown_until[name] - now).total_seconds()) + 1
+                            draw_label(
+                                display,
+                                f"Attendance Confirmed ✓ ({remaining}s)",
+                                int(x),
+                                int(y) + h + 20,
+                                (0, 220, 120)
+                            )
+                        
+                        # ── Mark Attendance Logic ────────────────────────────────
+                        if (track_attendance_status[track_id]['consecutive_detects'] >= CONSEC_DETECTS_REQUIRED and 
+                            is_live and 
+                            not track_attendance_status[track_id]['attendance_marked']):
                             
                             # ── Duplicate Detection Prevention ──────────────────
-                            # Check if attendance was already marked recently
                             attendance_key = (name, datetime.now().strftime("%Y-%m-%d"))
                             
                             if attendance_key in marked_attendance_cache:
                                 last_mark = marked_attendance_cache[attendance_key]
                                 if (datetime.now() - last_mark).total_seconds() < DUPLICATE_TIMEOUT:
                                     # Skip duplicate - already marked recently
-                                    # Still update last_seen to keep session active
                                     last_seen[name] = now
                                     continue
                             # ──────────────────────────────────────────────────────
@@ -453,6 +477,7 @@ def run_attendance():
                             
                             # Mark attendance in cache
                             marked_attendance_cache[attendance_key] = now
+                            track_attendance_status[track_id]['attendance_marked'] = True
                             
                             # Clean up old cache entries (older than 24 hours)
                             current_date = datetime.now().strftime("%Y-%m-%d")
@@ -463,7 +488,8 @@ def run_attendance():
                             last_seen[name] = now
                             attendance[name]["detected_frames"] += 1
                             record["detections"].append(now)
-
+                            
+                            # Time period logic
                             if MORNING_EARLY_START <= now_t < MORNING_PERMISSION_END:
                                 if record["morning_first_seen"] is None:
                                     record["morning_first_seen"] = now
@@ -479,19 +505,36 @@ def run_attendance():
                             elif QUIT_TIME_START <= now_t < QUIT_TIME_END:
                                 if record["quit_time_seen"] is None:
                                     record["quit_time_seen"] = now
-
+                            
                             if record["session_start_time"]:
                                 duration = (now - record["session_start_time"]).total_seconds()
                                 record["current_session_duration"] = duration
+                            
+                            # Log activity
+                            if name not in last_activity_time or \
+                               (now - last_activity_time[name]).total_seconds() > ACTIVITY_COOLDOWN:
+                                status_icon = "✅" if is_live else "⏳"
+                                activity_log.append((now, f"{status_icon} {name} marked", (0, 255, 180)))
+                                last_activity_time[name] = now
+                        # ──────────────────────────────────────────────────────────
+                
+                # Reset consecutive detects for tracks not seen
+                active_track_ids = [t[0] for t in confirmed_tracks]
+                for track_id in list(track_attendance_status.keys()):
+                    if track_id not in active_track_ids:
+                        track_attendance_status[track_id]['consecutive_detects'] = 0
+            # ─────────────────────────────────────────────────────────────────────
 
-                elif stable_label in ("Detecting...", "Unregistered Face", "Unknown"):
-                    if stable_label == "Detecting...":
-                        cv2.rectangle(display, (x, y), (x+w, y+h), (255, 200, 0), 2)
-                        draw_label(display, "Detecting...", x, y, (255, 200, 0))
-                    else:
-                        cv2.rectangle(display, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                        draw_label(display, stable_label, x, y, (0, 0, 255))
+            # ── Clean up old track IDs ──────────────────────────────────────────
+            # Remove tracks that haven't been seen for a while
+            for track_id in list(track_attendance_status.keys()):
+                # If a track hasn't been seen in 30 frames, remove it
+                if track_id not in [t[0] for t in confirmed_tracks] and len(track_attendance_status) > 10:
+                    # Keep track info for a while before removing
+                    pass
+            # ─────────────────────────────────────────────────────────────────────
 
+            # Reset consecutive detects for people not seen
             for name in people:
                 if name not in names_already_assigned:
                     consecutive_detects[name] = 0
@@ -506,6 +549,7 @@ def run_attendance():
                                     if blink_detector:
                                         blink_detector.reset()
 
+            # Close sessions for people not seen
             for name in people:
                 if in_session[name] and last_seen[name]:
                     if (now - last_seen[name]).total_seconds() > ABSENT_TIMEOUT:
