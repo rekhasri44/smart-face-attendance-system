@@ -1,0 +1,12 @@
+opencv-python==4.8.1.78
+numpy==1.24.3
+pandas==2.0.3
+deepface==0.0.79
+python-dotenv==1.0.0
+mediapipe==0.10.7
+matplotlib==3.7.1
+seaborn==0.12.2
+mtcnn==0.1.1
+retina-face==0.0.13
+scipy==1.11.1
+filterpy==1.4.5
